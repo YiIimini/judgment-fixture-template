@@ -1,0 +1,3 @@
+{"rule_no": "R-01", "id": "positive-basic", "kind": "positive", "control": "none", "owner": "example", "criterion_version": 1, "given": {"items": [{"id": "a", "value": 3}, {"id": "b", "value": 5}]}, "expect": {"total": 8}, "on_violation": "FAIL"}
+{"rule_no": "R-02", "id": "negative-wrong-expect", "kind": "positive", "control": "negative", "owner": "example", "criterion_version": 1, "given": {"items": [{"id": "a", "value": 3}, {"id": "b", "value": 5}]}, "expect": {"total": 99}, "on_violation": "MUST_FAIL"}
+{"rule_no": "R-03", "id": "missing-field-unknown", "kind": "positive", "control": "none", "owner": "example", "criterion_version": 1, "given": {"items": [{"id": "a"}]}, "expect": {"total": 8}, "on_violation": "UNKNOWN_MISSING_FIELD"}
