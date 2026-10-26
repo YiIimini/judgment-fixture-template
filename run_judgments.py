@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
-"""Minimal judgment-fixture runner.
+"""Minimal judgment-fixture runner (v2).
 
-Exit codes:
-  0  all positive rules pass, all negative controls red (or no negative control declared)
+Exit codes
+  0  all positive rules passed; every negative control went red for the RIGHT reason
   2  a positive rule failed
-  3  a negative control did NOT go red -> the whole suite is untrustworthy
-  4  criterion_version missing or mixed within one batch
-  5  selftest failed: the checker itself cannot go red
-  6  UNKNOWN_MISSING_FIELD: observation lacks a required field
+  3  NO_NEGATIVE_CONTROL: no negative control in the suite (or a negative control did not go red)
+  4  fixture-bad: malformed row, unknown expect key, missing/mixed criterion_version
+  5  SELFTEST_FAILED: the checker cannot produce both red and green through check()
+  6  UNKNOWN_MISSING_FIELD: observation lacks a required field and the rule did not declare it
+  7  NEGATIVE_RED_WRONG_REASON: a negative control went "red" via UNKNOWN instead of FAIL
 
-Design notes (why it looks like this):
+Design notes (each one is a bug we hit and then fixed):
   * expected values come only from this file, never from the code under test;
-  * every positive rule SHOULD have a paired negative control ("negative" control);
-  * a negative control is expected to FAIL. If it passes, the suite is lying.
-  * --selftest builds a deliberately wrong rule in memory and runs it through the
-    same check(): if it cannot go red, the checker is broken.
+  * unknown must never be silently treated as pass (positive rule) **or as red** (negative control);
+  * a suite without a negative control is not green, it is unverified;
+  * selftest needs a must-red twin AND a must-green twin, otherwise a constant-FAIL
+    checker passes selftest and turns every negative control "red";
+  * criterion_version must be an int; null/missing/mixed -> fixture-bad.
 """
 import argparse, json, sys
 
 REQUIRED = ("rule_no", "id", "kind", "criterion_version", "given", "expect")
+KNOWN_EXPECT_KEYS = {"total"}
 
 
 def load_rules(path):
@@ -31,11 +34,19 @@ def load_rules(path):
             try:
                 rule = json.loads(line)
             except json.JSONDecodeError as exc:
-                bad.append((lineno, f"not json: {exc}"))
-                continue
+                bad.append((lineno, f"not json: {exc}")); continue
             missing = [k for k in REQUIRED if k not in rule]
             if missing:
-                bad.append((lineno, f"missing keys: {missing}"))
+                bad.append((lineno, f"missing keys: {missing}")); continue
+            if not isinstance(rule["criterion_version"], int) or isinstance(rule["criterion_version"], bool):
+                bad.append((lineno, f"criterion_version must be int, got {rule['criterion_version']!r}"))
+                continue
+            exp = rule.get("expect")
+            if not isinstance(exp, dict) or len(exp) != 1:
+                bad.append((lineno, "expect must be an object with exactly one key")); continue
+            key = next(iter(exp))
+            if key not in KNOWN_EXPECT_KEYS:
+                bad.append((lineno, f"unknown expect key {key!r} (known: {sorted(KNOWN_EXPECT_KEYS)})"))
                 continue
             rules.append(rule)
     return rules, bad
@@ -50,36 +61,35 @@ def version_guard(rules):
     return "ok", versions
 
 
-def total_of(given):
+def observe(given):
     """Observation: sum of item values, but ONLY over fields that exist.
 
-    Note: this returns None when the items list is absent. It never invents 0.
+    Returns None when anything required is absent. It never invents 0.
     """
     items = given.get("items")
     if items is None:
         return None
     total = 0
     for item in items:
-        if "value" not in item:
+        if not isinstance(item, dict) or "value" not in item:
             return None
         total += item["value"]
     return total
 
 
 def check(rule):
-    """Return (verdict, detail). verdict in PASS / FAIL / UNKNOWN_MISSING_FIELD."""
-    observed = total_of(rule["given"])
-    expected = rule["expect"].get("total")
+    """Return (verdict, detail); verdict in PASS / FAIL / UNKNOWN_MISSING_FIELD."""
+    observed = observe(rule["given"])
+    key = next(iter(rule["expect"]))
+    expected = rule["expect"][key]
     if observed is None:
         return "UNKNOWN_MISSING_FIELD", "observation has no complete items/values"
-    expected_key = next(iter(rule["expect"]))
-    obs = rule["given"] and {expected_key: observed}
-    if obs[expected_key] == expected:
-        return "PASS", f"{expected_key}={observed}"
-    return "FAIL", f"{expected_key}: expected {expected}, got {observed}"
+    if observed == expected:
+        return "PASS", f"{key}={observed}"
+    return "FAIL", f"{key}: expected {expected}, got {observed}"
 
 
-def run(path):
+def run(path, allow_no_negative=False):
     rules, bad = load_rules(path)
     if bad:
         for lineno, why in bad:
@@ -91,29 +101,46 @@ def run(path):
         return 4
     print(f"[version] criterion_version={sorted(versions)}")
 
-    failed_positive, negative_ok, negative_bad, unknown = [], 0, [], 0
+    negatives = [r for r in rules if r.get("control") == "negative"]
+    if not negatives and not allow_no_negative:
+        print("[no-negative-control] suite has no negative control: unverified, not green")
+        return 3
+
+    failed_positive, red_right, red_wrong, unknown, declared_unknown_miss = [], 0, [], 0, []
     for rule in rules:
         verdict, detail = check(rule)
-        is_negative = rule.get("control") == "negative"
         shown = f"{rule['rule_no']} {rule['id']}"
+        is_negative = rule.get("control") == "negative"
+        declares_unknown = rule.get("on_violation") == "UNKNOWN_MISSING_FIELD"
+
         if verdict == "UNKNOWN_MISSING_FIELD":
             unknown += 1
-            print(f"  UNKNOWN {shown}: {detail}")
-            # A rule may DECLARE that unknown is the expected outcome (on_violation).
-            # Declaring it is different from silently treating unknown as pass.
-            if is_negative or rule.get("on_violation") == "UNKNOWN_MISSING_FIELD":
-                negative_ok += 1
+            if is_negative:
+                red_wrong.append((shown, "UNKNOWN", detail))
+                print(f"  NEGATIVE-CONTROL UNKNOWN <-- red for the wrong reason {shown}: {detail}")
+            elif declares_unknown:
+                declared_unknown_miss.append((shown, detail))
+                print(f"  UNKNOWN (declared) {shown}: {detail}")
             else:
                 failed_positive.append((shown, verdict, detail))
+                print(f"  UNKNOWN {shown}: {detail}")
             continue
+
         if is_negative:
             if verdict == "FAIL":
-                negative_ok += 1
+                red_right += 1
                 print(f"  NEGATIVE-CONTROL RED (as expected) {shown}: {detail}")
             else:
-                negative_bad.append((shown, verdict, detail))
+                red_wrong.append((shown, verdict, detail))
                 print(f"  NEGATIVE-CONTROL PASSED <-- suite untrustworthy {shown}: {detail}")
             continue
+
+        if declares_unknown:
+            # Declared outcome was UNKNOWN, but the rule actually computed a real verdict.
+            failed_positive.append((shown, f"DECLARED_UNKNOWN_GOT_{verdict}", detail))
+            print(f"  FAIL (declared unknown, got {verdict}) {shown}: {detail}")
+            continue
+
         if verdict == "PASS":
             print(f"  PASS {shown}: {detail}")
         else:
@@ -121,32 +148,36 @@ def run(path):
             print(f"  FAIL {shown}: {detail}")
 
     print()
-    if negative_bad:
-        print(f"[suite-untrustworthy] {len(negative_bad)} negative control(s) did not go red.")
-        return 3
+    if red_wrong:
+        print(f"[negative-wrong-reason] {len(red_wrong)} negative control(s) not red for the right reason.")
+        return 7
     if failed_positive:
-        print(f"[failed] {len(failed_positive)} positive rule(s) failed.")
+        print(f"[failed] {len(failed_positive)} rule(s) failed.")
         return 2
-    print(f"[green] {negative_ok} negative control(s) red as expected; {unknown} unknown.")
+    print(f"[green] {red_right} negative control(s) red as expected; "
+          f"{len(declared_unknown_miss)} declared-unknown; {unknown} unknown.")
     return 0
 
 
 def selftest():
-    """Prove the checker itself can go red, independently of the fixture file."""
-    broken = {
-        "rule_no": "S-01",
-        "id": "selftest-deliberately-wrong",
-        "kind": "positive",
-        "control": "none",
-        "criterion_version": 1,
-        "given": {"items": [{"id": "a", "value": 1}]},
-        "expect": {"total": 999},
-    }
-    verdict, detail = check(broken)
-    if verdict == "PASS":
-        print("[selftest] FAILED: checker returned PASS for a deliberately wrong rule")
-        return 5
-    print(f"[selftest] OK: wrong rule judged {verdict} ({detail})")
+    """Prove the checker can produce BOTH red and green through check().
+
+    A constant-FAIL checker passes a must-red-only selftest; the must-green twin
+    is what catches it.
+    """
+    must_red = {"rule_no": "S-1", "id": "selftest-must-red", "kind": "positive", "control": "none",
+                "criterion_version": 1, "given": {"items": [{"id": "a", "value": 1}]},
+                "expect": {"total": 999}}
+    must_green = {"rule_no": "S-2", "id": "selftest-must-green", "kind": "positive", "control": "none",
+                  "criterion_version": 1, "given": {"items": [{"id": "a", "value": 1}]},
+                  "expect": {"total": 1}}
+    v_red, d_red = check(must_red)
+    v_green, d_green = check(must_green)
+    if v_red == "PASS":
+        print(f"[selftest] FAILED: must-red rule judged {v_red}"); return 5
+    if v_green != "PASS":
+        print(f"[selftest] FAILED: must-green rule judged {v_green} ({d_green}) -- checker cannot pass anything"); return 5
+    print(f"[selftest] OK: must-red judged {v_red}; must-green judged PASS")
     return 0
 
 
@@ -154,11 +185,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("fixture", nargs="?", default="judgments.example.jsonl")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--allow-no-negative", action="store_true",
+                    help="explicitly accept a suite without negative controls (not recommended)")
     args = ap.parse_args()
     code = selftest()
     if code:
         return code
-    return run(args.fixture)
+    return run(args.fixture, args.allow_no_negative)
 
 
 if __name__ == "__main__":
